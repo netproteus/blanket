@@ -27,6 +27,11 @@ var parseAndModify = (inBrowser ? window.falafel : require("falafel"));
         "ForInStatement"  ,
         "WithStatement"
     ],
+    linesToAddBranchTracking = [
+        "IfStatement",
+        "SwitchCase",
+        "ConditionalExpression"
+    ],
     __blanket,
     copynumber = Math.floor(Math.random()*1000),
     coverageInfo = {},options = {
@@ -127,6 +132,8 @@ var parseAndModify = (inBrowser ? window.falafel : require("falafel"));
         },
         _trackingArraySetup: [],
         _branchingArraySetup: [],
+        _functionSetup: {},
+        _branchSetup: {},
         _prepareSource: function(source){
             return source.replace(/\\/g,"\\\\").replace(/'/g,"\\'").replace(/(\r\n|\n|\r)/gm,"\n").split('\n');
         },
@@ -146,6 +153,34 @@ var parseAndModify = (inBrowser ? window.falafel : require("falafel"));
                 intro += covVar+"[f].branchData[l][c][1] = "+covVar+"[f].branchData[l][c][1] || [];";
                 intro += covVar+"[f].branchData[l][c][1].push(r); }";
                 intro += "return r;};\n";
+
+                intro +=
+                 "var _$branchTrack = function(filename, lineNumber, branchId, branchCount, branchCase) {" +
+                 "    var coverVar = " + covVar + ";" +
+                 "    coverVar[filename].branchTracks = coverVar[filename].branchTracks || {};" +
+                 "    coverVar[filename].branchTracks[lineNumber] = coverVar[filename].branchTracks[lineNumber] || {};" +
+                 "    var counts = coverVar[filename].branchTracks[lineNumber][branchId];" +
+                 "    if (!counts) {" +
+                 "        counts = Array.apply(null, new Array(branchCount)).map(Number.prototype.valueOf,0);" +
+                 "        coverVar[filename].branchTracks[lineNumber][branchId] = counts;" +
+                 "    }" +
+                 "    if (Object.prototype.toString.call(branchCase) === '[object Number]') {" +
+                 "        counts[branchCase]++;" +
+                 "    }" +
+                 "    else {" +
+                 "        branchCase = !!branchCase;" +
+                 "        counts[branchCase ? 0 : 1]++;" +
+                 "    }" +
+                 "    return branchCase;" +
+                 "};\n";
+
+                intro +=
+                "    var _$functionTrack = function(filename, lineNumber, name) {" +
+                "    var coverVar = " + covVar + ";" +
+                "    coverVar[filename].functionTracks = coverVar[filename].functionTracks || {};" +
+                "    coverVar[filename].functionTracks[lineNumber] = coverVar[filename].functionTracks[lineNumber] || {name: name, count: 0};" +
+                "    coverVar[filename].functionTracks[lineNumber].count++;" +
+                "};\n";
             }
             intro += "if (typeof "+covVar+"['"+filename+"'] === 'undefined'){";
 
@@ -175,8 +210,29 @@ var parseAndModify = (inBrowser ? window.falafel : require("falafel"));
                         intro += covVar+"['"+filename+"'].branchData["+item.line+"]["+item.column+"].alternate = "+JSON.stringify(item.alternate)+";\n";
                     }
                 });
+
+                Object.keys(_blanket._functionSetup[filename]).map(function(lineNumber){
+                    intro +=
+                    "    (function() {" +
+                    "        var coverVar = " + covVar + ";" +
+                    "        coverVar['" + filename + "'].functionTracks = coverVar['" + filename + "'].functionTracks || {};" +
+                    "        coverVar['" + filename + "'].functionTracks[" + lineNumber + "] = " + JSON.stringify(_blanket._functionSetup[filename][lineNumber]) + ";" +
+                    "    }());\n";
+                });
+
+                Object.keys(_blanket._branchSetup[filename]).map(function(lineNumber){
+                    Object.keys(_blanket._branchSetup[filename][lineNumber]).map(function(colNumber) {
+                        intro +=
+                        "    (function() {" +
+                        "        var coverVar = " + covVar + ";" +
+                        "        coverVar['" + filename + "'].branchTracks = coverVar['" + filename + "'].branchTracks || {};" +
+                        "        coverVar['" + filename + "'].branchTracks[" + lineNumber + "] = coverVar['" + filename + "'].branchTracks[" + lineNumber + "] || {};" +
+                        "        coverVar['" + filename + "'].branchTracks[" + lineNumber + "][" + colNumber + "] = Array.apply(null, new Array(" + _blanket._branchSetup[filename][lineNumber][colNumber] + ")).map(Number.prototype.valueOf,0);" +
+                        "    }());\n";
+                    });
+                });
             }
-            intro += "}";
+            intro += "}\n";
 
             return intro;
         },
@@ -210,6 +266,73 @@ var parseAndModify = (inBrowser ? window.falafel : require("falafel"));
                           ")?"+node.consequent.source()+":"+node.alternate.source();
             node.update(updated);
         },
+        _trackBranch2: function(node, filename) {
+            var line, col, branchCase, updated, branchCount = 2;
+            if (node.type === 'SwitchCase') {
+                line = node.parent.loc.start.line;
+                col = node.parent.loc.start.column;
+            }
+            else {
+                line = node.loc.start.line;
+                col = node.loc.start.column;
+            }
+
+            var fileRecord = (_blanket._branchSetup[filename] = (_blanket._branchSetup[filename] || {}));
+            var lineRecord = (fileRecord[line] = fileRecord[line] || {});
+            lineRecord[col] = branchCount;
+
+            switch (node.type) {
+                case 'SwitchCase':
+                    branchCase = node.parent.cases.indexOf(node);
+                    branchCount = node.parent.cases.length;
+                    // update for SwitchCase
+                    lineRecord[col] = branchCount;
+
+                    updated = node.test ? "case " + node.test.source() + ":\n" : "default :\n";
+                    updated += "_$branchTrack('" + filename + "'," + line + "," + col + "," + branchCount + "," + branchCase + ");\n";
+                    node.consequent.map(function(consequent) {
+                        updated += consequent.source();
+                        updated += "\n";
+                    });
+
+                    break;
+                case 'ConditionalExpression':
+
+                    updated = "_$branchTrack('" + filename + "'," + line + "," + col + "," + branchCount + "," + node.test.source() + ") ? ";
+                    updated += node.consequent.source() + ":";
+                    updated += node.alternate.source() + "\n";
+
+                    break;
+                case 'IfStatement':
+
+                    node.test.update("_$branchTrack('" + filename + "'," + line + "," + col + "," + branchCount + "," + node.test.source() + ")");
+                    // we just update the test so return;
+                    return;
+            }
+
+            node.update(updated);
+
+        },
+        _trackFunction: function(node, filename) {
+            var line = node.loc.start.line;
+            var name = (node.id && node.id.name) || "anonymous";
+
+            var updatedBody = "{_$functionTrack('" + filename + "'," + line + ",'" + line + "_" + name + "');\n";
+
+            if (node.body.body) {
+                node.body.body.map(function(body) {
+                    updatedBody += body.source();
+                    updatedBody += "\n";
+                });
+            }
+
+            updatedBody += "}\n";
+
+            node.body.update(updatedBody);
+
+            var fileRecord = (_blanket._functionSetup[filename] = (_blanket._functionSetup[filename] || {}));
+            fileRecord[line] = {name: line + "_" + name, count: 0};
+        },
         _addTracking: function (filename) {
             //falafel doesn't take a file name
             //so we include the filename in a closure
@@ -218,6 +341,14 @@ var parseAndModify = (inBrowser ? window.falafel : require("falafel"));
 
             return function(node){
                 _blanket._blockifyIf(node);
+
+                if (_blanket.options("branchTracking") && linesToAddBranchTracking.indexOf(node.type) > -1) {
+                    _blanket._trackBranch2(node, filename);
+                }
+
+                if (node.type === 'FunctionDeclaration' || node.type === 'FunctionExpression') {
+                    _blanket._trackFunction(node, filename);
+                }
 
                 if (linesToAddTracking.indexOf(node.type) > -1 && node.parent.type !== "LabeledStatement") {
                     _blanket._checkDefs(node,filename);
@@ -233,7 +364,7 @@ var parseAndModify = (inBrowser ? window.falafel : require("falafel"));
                         throw new Error("The instrumenter encountered a node with no location: "+Object.keys(node));
                     }
                 }else if (_blanket.options("branchTracking") && node.type === "ConditionalExpression"){
-                    _blanket._trackBranch(node,filename);
+                    // _blanket._trackBranch(node,filename);
                 }
             };
         },
